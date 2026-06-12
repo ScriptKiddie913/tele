@@ -1,44 +1,56 @@
-"""
-Telegram bot that uses OpenRouter API for AI chat.
-Reads all configuration from environment variables.
-"""
-
 import os
 import asyncio
-import aiohttp
+import logging
+from typing import Dict, List
+
+import httpx
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ---------- CONFIGURATION FROM ENVIRONMENT ----------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("Missing TELEGRAM_BOT_TOKEN environment variable")
+# Load environment variables
+load_dotenv()
 
+# Configuration
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-if not OPENROUTER_API_KEY:
-    raise ValueError("Missing OPENROUTER_API_KEY environment variable")
-
-# Model – can be overridden with OPENROUTER_MODEL env var
-MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
-
-# Max conversation turns (user + assistant pairs) to keep
-try:
-    MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "10"))
-except ValueError:
-    MAX_HISTORY_TURNS = 10
-
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = "openai/gpt-3.5-turbo"  # You can change this to any OpenRouter supported model
+MAX_CONVERSATION_LEN = 10  # Number of message pairs to remember per user
+SYSTEM_PROMPT = "You are a helpful assistant."
 
-# In-memory conversation history per user
-# Format: { user_id: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...] }
-conversations = {}
+# Setup logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# ---------- HELPER: CALL OPENROUTER API ----------
-async def query_openrouter(messages):
+# Store conversation history in memory (for demo; use persistent DB in production)
+conversations: Dict[int, List[Dict[str, str]]] = {}
+
+def get_conversation(chat_id: int) -> List[Dict[str, str]]:
+    """Get conversation history for a chat_id, initializing if needed."""
+    if chat_id not in conversations:
+        conversations[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    return conversations[chat_id]
+
+def trim_conversation(messages: List[Dict[str, str]], max_pairs: int) -> List[Dict[str, str]]:
     """
-    Send a list of messages to OpenRouter and return the assistant's reply.
-    Handles timeouts and HTTP errors gracefully.
+    Keep system message + last N user-assistant pairs.
+    Each pair = 2 messages (user + assistant). System message excluded from count.
     """
+    system_messages = [m for m in messages if m["role"] == "system"]
+    non_system = [m for m in messages if m["role"] != "system"]
+    
+    # Keep last `max_pairs * 2` non-system messages
+    max_non_system = max_pairs * 2
+    if len(non_system) > max_non_system:
+        non_system = non_system[-max_non_system:]
+    
+    return system_messages + non_system
+
+async def query_openrouter(messages: List[Dict[str, str]]) -> str:
+    """Send messages to OpenRouter and return assistant's reply."""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -47,124 +59,107 @@ async def query_openrouter(messages):
         "model": MODEL,
         "messages": messages,
     }
-    timeout = aiohttp.ClientTimeout(total=30)  # 30 seconds timeout
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            async with session.post(OPENROUTER_URL, json=payload, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    # Extract the assistant's reply
-                    return data["choices"][0]["message"]["content"]
-                else:
-                    error_text = await resp.text()
-                    return f"⚠️ OpenRouter error (HTTP {resp.status}): {error_text[:200]}"
-        except asyncio.TimeoutError:
-            return "⏰ Request timed out. Please try again later."
+            response = await client.post(OPENROUTER_URL, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error: {e.response.status_code} - {e.response.text}")
+            return f"Error from OpenRouter: HTTP {e.response.status_code}"
+        except httpx.RequestError as e:
+            logger.error(f"Request error: {e}")
+            return f"Network error: {e}"
         except Exception as e:
-            return f"❌ Unexpected error: {str(e)[:200]}"
+            logger.error(f"Unexpected error: {e}")
+            return "An unexpected error occurred."
 
-# ---------- TELEGRAM HANDLERS ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a welcome message when /start is issued."""
     user = update.effective_user
     await update.message.reply_text(
-        f"Hello {user.first_name}!\n"
-        f"I'm a chat bot powered by OpenRouter (model: {MODEL}).\n"
-        "Just send me any message and I'll reply.\n"
-        "Commands:\n"
-        "/clear – reset our conversation history\n"
-        "/status – show current model and history limit\n"
-        "Source: https://openrouter.ai/"
+        f"Hi {user.first_name}! I'm an AI bot powered by OpenRouter.\n"
+        f"Send me any message and I'll reply using the {MODEL} model.\n"
+        f"Commands:\n/start - Show this message\n/reset - Clear conversation history\n/help - Show help"
     )
 
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Clear the conversation history for this user."""
-    user_id = update.effective_user.id
-    if user_id in conversations:
-        del conversations[user_id]
-    await update.message.reply_text("🧹 Conversation history cleared! Starting fresh.")
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show current configuration and conversation length."""
-    user_id = update.effective_user.id
-    history_len = len(conversations.get(user_id, []))
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send help message."""
     await update.message.reply_text(
-        f"🤖 Bot status:\n"
-        f"Model: `{MODEL}`\n"
-        f"Max history turns: {MAX_HISTORY_TURNS}\n"
-        f"Messages in current session: {history_len}\n"
-        f"(each turn = user + assistant message)"
+        "Just send me a message and I'll respond!\n"
+        "I remember the last few messages per conversation (up to {MAX_CONVERSATION_LEN} exchanges).\n"
+        "Use /reset to clear the conversation history."
     )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle any text message (not a command):
-    - Maintain per-user conversation history
-    - Call OpenRouter
-    - Store and send back the reply
-    """
-    user_id = update.effective_user.id
-    user_text = update.message.text
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reset conversation history for the user."""
+    chat_id = update.effective_chat.id
+    conversations[chat_id] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    await update.message.reply_text("Conversation history cleared! Starting fresh.")
 
-    # Initialize conversation history for this user if not present
-    if user_id not in conversations:
-        conversations[user_id] = []
-
-    history = conversations[user_id]
-
-    # Append the user's new message
-    history.append({"role": "user", "content": user_text})
-
-    # Trim history to the last (MAX_HISTORY_TURNS * 2) messages
-    max_messages = MAX_HISTORY_TURNS * 2
-    if len(history) > max_messages:
-        history[:] = history[-max_messages:]
-
-    # Send typing indicator to let user know the bot is processing
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle user message: add to history, get AI response, reply."""
+    chat_id = update.effective_chat.id
+    user_message = update.message.text
+    
+    # Ignore empty messages
+    if not user_message:
+        return
+    
+    # Show typing indicator
     await update.message.chat.send_action(action="typing")
+    
+    # Get conversation history
+    conversation = get_conversation(chat_id)
+    
+    # Add user message
+    conversation.append({"role": "user", "content": user_message})
+    
+    # Trim history if needed
+    conversation = trim_conversation(conversation, MAX_CONVERSATION_LEN)
+    
+    # Get AI response
+    ai_response = await query_openrouter(conversation)
+    
+    # Add assistant's reply to history (only if no error occurred that broke the format)
+    if not ai_response.startswith("Error") and not ai_response.startswith("Network"):
+        conversation.append({"role": "assistant", "content": ai_response})
+    
+    # Update stored conversation (after potential trimming again)
+    conversations[chat_id] = trim_conversation(conversation, MAX_CONVERSATION_LEN)
+    
+    # Send response (split if too long for Telegram)
+    if len(ai_response) > 4096:
+        for i in range(0, len(ai_response), 4096):
+            await update.message.reply_text(ai_response[i:i+4096])
+    else:
+        await update.message.reply_text(ai_response)
 
-    # Call OpenRouter with the current history
-    assistant_reply = await query_openrouter(history)
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors."""
+    logger.warning(f"Update {update} caused error {context.error}")
 
-    # Append assistant reply to history
-    history.append({"role": "assistant", "content": assistant_reply})
-
-    # Trim again just in case (should already be within limit)
-    if len(history) > max_messages:
-        history[:] = history[-max_messages:]
-
-    # Send the reply back to the user
-    await update.message.reply_text(assistant_reply)
-
-# ---------- GLOBAL ERROR HANDLER ----------
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors and optionally notify the user."""
-    print(f"Exception while handling an update: {context.error}")
-    if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "🤖 An internal error occurred. Please try again later or contact the bot admin."
-        )
-
-# ---------- MAIN FUNCTION ----------
-def main():
+def main() -> None:
     """Start the bot."""
-    # Build the Application
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # Add command handlers
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN environment variable not set")
+    if not OPENROUTER_API_KEY:
+        raise ValueError("OPENROUTER_API_KEY environment variable not set")
+    
+    # Create application
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("clear", clear))
-    app.add_handler(CommandHandler("status", status))
-
-    # Add message handler for all text messages (excluding commands)
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Register global error handler
     app.add_error_handler(error_handler)
-
-    print(f"Bot is polling... using model: {MODEL}")
-    print(f"Max history turns: {MAX_HISTORY_TURNS}")
+    
+    # Start polling
+    logger.info("Bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
